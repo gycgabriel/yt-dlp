@@ -112,6 +112,7 @@ from .utils import (
     RejectedVideoReached,
     SameFileError,
     UnavailableVideoError,
+    UnsafeExecExpansionError,
     UserNotLive,
     YoutubeDLError,
     age_restricted,
@@ -138,7 +139,7 @@ from .utils import (
     join_nonempty,
     locked_file,
     make_archive_id,
-    make_dir,
+    make_parent_dirs,
     number_of_digits,
     orderedSet,
     orderedSet_from_options,
@@ -595,7 +596,7 @@ class YoutubeDL:
         'width', 'height', 'asr', 'audio_channels', 'fps',
         'tbr', 'abr', 'vbr', 'filesize', 'filesize_approx',
         'timestamp', 'release_timestamp', 'available_at',
-        'duration', 'view_count', 'like_count', 'dislike_count', 'repost_count',
+        'duration', 'view_count', 'like_count', 'dislike_count', 'repost_count', 'save_count',
         'average_rating', 'comment_count', 'age_limit',
         'start_time', 'end_time',
         'chapter_number', 'season_number', 'episode_number',
@@ -826,9 +827,14 @@ class YoutubeDL:
         for pp_def_raw in self.params.get('postprocessors', []):
             pp_def = dict(pp_def_raw)
             when = pp_def.pop('when', 'post_process')
-            self.add_post_processor(
-                get_postprocessor(pp_def.pop('key'))(self, **pp_def),
-                when=when)
+            # Handle errors for ExecPP command validation
+            try:
+                self.add_post_processor(
+                    get_postprocessor(pp_def.pop('key'))(self, **pp_def),
+                    when=when)
+            except UnsafeExecExpansionError as e:
+                self.report_error(e)
+                raise
 
         def preload_download_archive(fn):
             """Preload the archive, if any is specified"""
@@ -1254,7 +1260,7 @@ class YoutubeDL:
         info_dict.pop('__pending_error', None)
         return info_dict
 
-    def prepare_outtmpl(self, outtmpl, info_dict, sanitize=False):
+    def prepare_outtmpl(self, outtmpl, info_dict, sanitize=False, *, _exec=False):
         """ Make the outtmpl and info_dict suitable for substitution: ydl.escape_outtmpl(outtmpl) % info_dict
         @param sanitize    Whether to sanitize the output as a filename
         """
@@ -1305,6 +1311,9 @@ class YoutubeDL:
                 (?:&(?P<replacement>.*?))?
                 (?:\|(?P<default>.*?))?
             )$''')
+        SAFE_EXEC_CONVERSIONS = 'difq'
+        UNSAFE_DEFAULT_CHARS = '"\' \n\t;&|^$%*<>{}()[]`#\\'
+        EXEC_ADVISORY_MSG = 'See  https://github.com/yt-dlp/yt-dlp/security/advisories/GHSA-69qj-pvh9-c5wg  for details'
 
         def _from_user_input(field):
             if field == ':':
@@ -1428,6 +1437,25 @@ class YoutubeDL:
             fmt = outer_mobj.group('format')
             if fmt == 's' and last_field in field_size_compat_map and isinstance(value, int):
                 fmt = f'0{field_size_compat_map[last_field]:d}d'
+
+            # Validate safety of exec commands
+            if _exec:
+                if fmt[-1] not in SAFE_EXEC_CONVERSIONS:
+                    raise UnsafeExecExpansionError(
+                        f'Unsafe conversion(s) in exec command: {outtmpl!r}\n'
+                        f'Conversions such as %()s are too dangerous to be used in '
+                        f'--exec command templates; use %()q instead. {EXEC_ADVISORY_MSG}')
+                elif any(unsafe_char in default for unsafe_char in UNSAFE_DEFAULT_CHARS):
+                    if default == na:
+                        raise UnsafeExecExpansionError(
+                            f'Unsafe placeholder for exec command: {na!r}\n'
+                            f'The --output-na-placeholder argument also applies to '
+                            f'--exec command templates. {EXEC_ADVISORY_MSG}')
+                    else:
+                        raise UnsafeExecExpansionError(
+                            f'Unsafe default(s) in exec command: {outtmpl!r}\n'
+                            f'Conversions are not applied to --exec command template defaults, '
+                            f'e.g. %(...|DEFAULT;)q. {EXEC_ADVISORY_MSG}')
 
             flags = outer_mobj.group('conversion') or ''
             str_fmt = f'{fmt[:-1]}s'
@@ -1602,8 +1630,10 @@ class YoutubeDL:
             if ret is NO_DEFAULT:
                 while True:
                     filename = self._format_screen(self.prepare_filename(info_dict), self.Styles.FILENAME)
-                    reply = input(self._format_screen(
-                        f'Download "{filename}"? (Y/n): ', self.Styles.EMPHASIS)).lower().strip()
+                    self.to_screen(
+                        self._format_screen(f'Download "{filename}"? (Y/n): ', self.Styles.EMPHASIS),
+                        skip_eol=True)
+                    reply = input().lower().strip()
                     if reply in {'y', ''}:
                         return None
                     elif reply == 'n':
@@ -2006,7 +2036,12 @@ class YoutubeDL:
             raise Exception(f'Invalid result type: {result_type}')
 
     def _ensure_dir_exists(self, path):
-        return make_dir(path, self.report_error)
+        try:
+            make_parent_dirs(path)
+            return True
+        except OSError as e:
+            self.report_error(f'Unable to create directory: {e}')
+            return False
 
     @staticmethod
     def _playlist_infodict(ie_result, strict=False, **kwargs):
@@ -3026,9 +3061,14 @@ class YoutubeDL:
         format_selector = self.format_selector
         while True:
             if interactive_format_selection:
-                req_format = input(self._format_screen('\nEnter format selector ', self.Styles.EMPHASIS)
-                                   + '(Press ENTER for default, or Ctrl+C to quit)'
-                                   + self._format_screen(': ', self.Styles.EMPHASIS))
+                if not formats:
+                    # Bypass interactive format selection if no formats & --ignore-no-formats-error
+                    formats_to_download = None
+                    break
+                self.to_screen(self._format_screen('\nEnter format selector ', self.Styles.EMPHASIS)
+                               + '(Press ENTER for default, or Ctrl+C to quit)'
+                               + self._format_screen(': ', self.Styles.EMPHASIS), skip_eol=True)
+                req_format = input()
                 try:
                     format_selector = self.build_format_selector(req_format) if req_format else None
                 except SyntaxError as err:
@@ -3370,7 +3410,9 @@ class YoutubeDL:
                 self.report_warning(
                     f'Cannot write internet shortcut file because the actual URL of "{info_dict["webpage_url"]}" is unknown')
                 return True
-            linkfn = replace_extension(self.prepare_filename(info_dict, 'link'), link_type, info_dict.get('ext'))
+            linkfn = replace_extension(
+                self.prepare_filename(info_dict, 'link'), link_type,
+                info_dict.get('ext'), _allowed_exts=tuple(LINK_TEMPLATES))
             if not self._ensure_dir_exists(linkfn):
                 return False
             if self.params.get('overwrites', True) and os.path.exists(linkfn):
@@ -3474,11 +3516,12 @@ class YoutubeDL:
                     if dl_filename is not None:
                         self.report_file_already_downloaded(dl_filename)
                     elif fd:
-                        for f in info_dict['requested_formats'] if fd != FFmpegFD else []:
-                            f['filepath'] = fname = prepend_extension(
-                                correct_ext(temp_filename, info_dict['ext']),
-                                'f{}'.format(f['format_id']), info_dict['ext'])
-                            downloaded.append(fname)
+                        if fd != FFmpegFD and temp_filename != '-':
+                            for f in info_dict['requested_formats']:
+                                f['filepath'] = fname = prepend_extension(
+                                    correct_ext(temp_filename, info_dict['ext']),
+                                    'f{}'.format(f['format_id']), info_dict['ext'])
+                                downloaded.append(fname)
                         info_dict['url'] = '\n'.join(f['url'] for f in info_dict['requested_formats'])
                         success, real_download = self.dl(temp_filename, info_dict)
                         info_dict['__real_download'] = real_download
